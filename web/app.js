@@ -11,6 +11,8 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 /* Member D's task module owns templates, tool matching and impact. Loaded first. */
 const D = window.BND_TASK || globalThis.BND_TASK;
 if (!D) throw new Error('web/task-module.js must be loaded before app.js');
+const M = window.BND_MAP || globalThis.BND_MAP;
+if (!M) throw new Error('web/map-module.js must be loaded before app.js');
 const API = window.BND_API || globalThis.BND_API;
 if (!API) throw new Error('web/api.js must be loaded before app.js');
 const client = API.createClient({ baseUrl: window.BND_API_BASE || globalThis.BND_API_BASE });
@@ -34,6 +36,7 @@ const TRANSITION_TOAST = {
 /* ------------------------------------------------------------- session only */
 const TOKEN_KEY = 'bnd.token';
 const USER_KEY = 'bnd.user';
+const PREV_KEY = 'bnd.previousHomePostcode';
 const readStore = k => { try { return localStorage.getItem(k); } catch { return null; } };
 const writeStore = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
 const dropStore = k => { try { localStorage.removeItem(k); } catch { /* private mode */ } };
@@ -42,10 +45,16 @@ let token = readStore(TOKEN_KEY);
 if (token) client.setToken(token);
 
 function freshState() {
-  return { me: null, templates: [], tools: [], tasks: [], loans: [], environment: null, impact: null, names: {} };
+  return {
+    me: null, templates: [], tools: [], tasks: [], loans: [],
+    environment: null, impact: null, names: {},
+    /* The postcode the account moved away from, so the UI can offer a
+       one-click way back; null once there is nothing to return to. */
+    previousHomePostcode: null
+  };
 }
 let state = freshState();
-let ui = { filter: 'all', search: '', loanTab: 'borrowed', busy: false, loading: false, message: '' };
+let ui = { filter: 'all', search: '', loanTab: 'borrowed', selectedTaskId: null, selectedPlaceId: null, selectedPlaceCommunityId: null, busy: false, loading: false, message: '' };
 let toastTimer;
 function toast(message) { $('#toast').textContent = message; $('#toast').classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('visible'), 5200); }
 
@@ -61,10 +70,24 @@ function buildNames() {
 const nameOf = id => (state.me && state.me.id === id && state.me.display_name) || state.names[id] || 'A neighbour';
 const soft = promise => promise.catch(err => { if (err && err.code === 'UNAUTHENTICATED') throw err; return null; });
 const groupOf = category => (D.CATEGORIES[category] || {}).group || '';
+/* Client-side mirror of the backend's postcode normalisation (trim, uppercase,
+   collapse spaces) so checking the street you are already in is a no-op that
+   never reaches the move endpoint. */
+const normalisePostcode = v => String(v || '').trim().toUpperCase().replace(/\s+/g, ' ');
+/* The stored previous street is a UI hint only — the authoritative community is
+   always the server's /me — so it is only offered while it differs from the
+   current home; a hint pointing at home is stale and dropped. */
+function restorePreviousHome() {
+  const stored = readStore(PREV_KEY);
+  if (stored && stored !== homePostcode()) { state.previousHomePostcode = stored; return; }
+  if (stored) dropStore(PREV_KEY);
+  state.previousHomePostcode = null;
+}
 
 /* ------------------------------------------------------------------- loading */
 async function loadAll() {
   state.me = await client.me();
+  restorePreviousHome();
   await refresh();
 }
 async function refresh() {
@@ -107,9 +130,14 @@ function slot(name, placeholder){const raw=window.BND_INTEGRATIONS?.[name];if(!r
 
 /* ------------------------------------------------------------------ routing */
 function page(){return ['community','task','loans'].includes(location.hash.slice(1))?location.hash.slice(1):'community';}
-const postcode = () => (state.me ? state.me.community.postcode : '');
+/* The signed-in account's own community — what tasks, loans, lending and the
+   whole community page follow. Checking a postcode moves this, so there is
+   exactly one community context, never a separate browse one. */
+const homeCommunity = () => (state.me ? state.me.community : null);
+const homePostcode = () => (state.me ? state.me.community.postcode : '');
+const homeOutcode = () => (state.me ? state.me.community.outcode : '');
 const myTasks = () => state.tasks.filter(t => state.me && t.creator && t.creator.id === state.me.id);
-const myOpenTask = () => myTasks().filter(t => t.status === 'open')
+const myOpenTask = () => myTasks().find(t => t.status === 'open' && t.id === ui.selectedTaskId) || myTasks().filter(t => t.status === 'open')
   .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0] || null;
 function taskContext(task) {
   return {
@@ -124,10 +152,9 @@ function loginView(message) {
   return `<div class="login-shell"><section class="panel login-panel">
   <span class="eyebrow">DEMO ACCOUNTS</span>
   <h2>Sign in to your street.</h2>
-  <p class="muted">Borrow Next Door runs in demo mode against the local API. Choose an account and enter the shared access code (runtime config — never stored in this page).</p>
+  <p class="muted">Borrow Next Door runs in demo mode against the local API. Pick a demo account and sign in — no access code, no real registrations.</p>
   <form id="login-form">
-    <label>Account<select name="user_alias"><option value="alice">Alice · demo account</option><option value="bob">Bob · demo account</option></select></label>
-    <label>Access code<input name="access_code" type="password" autocomplete="off" placeholder="Team DEMO_ACCESS_CODE" required></label>
+    <label>Account<select name="user_alias"><option value="alice">Alice · demo account</option><option value="bob">Bob · demo account</option><option value="carol">Carol · demo account</option></select></label>
     <p class="field-message ${message ? 'error' : ''}" id="login-message">${esc(message || 'Demo accounts only — no real registrations.')}</p>
     <button class="btn primary" type="submit">Sign in <span>↗</span></button>
   </form>
@@ -148,7 +175,7 @@ function bootErrorView(message) {
   return `<div class="login-shell"><section class="panel login-panel"><span class="eyebrow">CONNECTION</span>
   <h2>We cannot reach the API.</h2><p class="field-message error">${esc(message)}</p>
   <p class="muted">Start the backend, then try again:</p>
-  <p class="notice"><code>DEMO_ACCESS_CODE=&lt;your team code&gt; backend/.venv/bin/uvicorn app.main:app --port 8000</code></p>
+  <p class="notice"><code>backend/.venv/bin/uvicorn app.main:app --port 8000</code></p>
   <button class="btn primary" id="retry-boot">Try again <span>↗</span></button></section></div>`;
 }
 function setLoginMessage(message) {
@@ -157,6 +184,8 @@ function setLoginMessage(message) {
   else renderLogin(message);
 }
 function clearSession() {
+  ui.selectedTaskId = null;
+  ui.selectedPlaceId = null; ui.selectedPlaceCommunityId = null;
   dropStore(TOKEN_KEY); dropStore(USER_KEY);
   token = null; client.setToken(null);
 }
@@ -182,14 +211,27 @@ async function boot() {
 /* --------------------------------------------------------------- busy wrapper */
 function setButtonsDisabled(off) { document.querySelectorAll('button').forEach(b => { b.disabled = off; }); }
 function handleError(err, opts) {
-  // A 401 while signing in means "wrong access code", not "expired session".
+  // A 401 while signing in means "unknown demo account", not "expired
+  // session" — the caller opts out of the session-clearing path with
+  // { ignoreAuth: true } and shows its own message instead.
   if (err && err.code === 'UNAUTHENTICATED' && !(opts && opts.ignoreAuth)) {
     clearSession(); state = freshState();
     renderLogin('Your session has expired. Please sign in again.');
     return;
   }
+  const FRIENDLY = {
+    OUT_OF_RANGE: 'That tool is in another neighbourhood. Borrowing works within 2 km of your street.',
+    TOOL_UNAVAILABLE: 'This tool is already reserved or on loan.',
+    TOOL_ARCHIVED: 'That tool is no longer listed.',
+    SELF_BORROW_FORBIDDEN: 'That is your own tool — a neighbour has to borrow it.',
+    REQUIREMENT_OCCUPIED: 'Another request already covers that slot.',
+    REQUIREMENT_LOCKED: 'That slot is locked (already requested or used).',
+    FORBIDDEN: 'You do not have permission for that action.'
+  };
   if (opts && typeof opts.onError === 'function') opts.onError(err);
-  toast(err && err.message ? err.message : 'Something went wrong. Please try again.');
+  const code = err && err.code;
+  const verbatim = err && err.status === 422 && opts && opts.verbatim422;
+  toast((verbatim ? err.message : code && FRIENDLY[code]) || (err && err.message) || 'Something went wrong. Please try again.');
 }
 /** Disable everything, run one user intent, surface server errors, then repaint
  *  only on success — so a failed form keeps what the user typed. */
@@ -216,49 +258,321 @@ function provider(env, key) {
   if (env.providers && env.providers[key]) return env.providers[key];
   return env[key] || null;
 }
+const ENV_READING = {
+  air_quality: { field: 'aqi', unit: 'AQI', scope: 'Regional forecast (~11km grid)' },
+  carbon_intensity: { field: 'clean_energy_percentage', unit: '% clean electricity', scope: 'Regional grid zone' }
+};
 function envCard(icon, title, providerKey, source) {
   const p = provider(state.environment, providerKey);
-  const ok = !!p && (p.status === 'ok' || p.status === 'cached');
-  const detail = ok ? (p.attribution || p.source || 'Connected') : `${source} · awaiting provider`;
-  const inner = `<span class="env-icon">${icon}</span><div><h3>${title}</h3><strong>${ok ? esc(String(p.attribution || 'Connected').slice(0, 30)) : 'Awaiting data'}</strong><span class="status-tag">${ok ? 'Connected' : 'Not connected'}</span><p>${esc(detail)}</p></div>`;
+  const spec = ENV_READING[providerKey] || { field: null, unit: '', scope: '' };
+  const ok = isFreshProvider(p);
+  const value = ok && p.data && spec.field ? finiteNumber(p.data[spec.field]) : null;
+  let headline, detail, tag, subline;
+  if (value !== null) {
+    headline = `<strong>${esc(String(value))}</strong> <span class="env-unit">${esc(spec.unit)}</span>`;
+    detail = (p.data && p.data.scope) || spec.scope;
+    tag = 'Connected';
+    subline = p.attribution || p.source || source;
+  } else if (ok) {
+    headline = '<strong class="pending">—</strong>';
+    detail = `${(p.data && p.data.scope) || spec.scope} · no number reported yet`;
+    tag = 'Connected';
+    subline = p.attribution || p.source || source;
+  } else {
+    headline = '<strong class="pending">—</strong>';
+    detail = `${source} · awaiting provider`;
+    tag = 'Not connected';
+    subline = '';
+  }
+  const inner = `<span class="env-icon">${icon}</span><div><h3>${title}</h3>${headline}<span class="status-tag">${tag}</span><p>${esc(detail)}</p>${subline ? `<p class="env-source">${esc(subline)}</p>` : ''}</div>`;
   return `<div class="env-card">${slot(title === 'The air around you' ? 'air' : 'electricity', inner)}</div>`;
 }
-function toolCards() {
-  const me = state.me;
-  const tools = state.tools.filter(t => t.availability !== 'archived' &&
+function listedTools() {
+  return state.tools.filter(t => t.availability !== 'archived' &&
     String(t.name || '').toLowerCase().includes(ui.search.toLowerCase()) &&
     (ui.filter === 'all' || ui.filter === 'available' && t.availability === 'available' ||
      ui.filter === 'garden' && groupOf(t.category) === 'garden' ||
      ui.filter === 'cleanup' && groupOf(t.category) === 'cleanup'));
-  if (!tools.length) return `<div class="empty"><h3>A little room for sharing.</h3><p>No tools match this search in ${esc(postcode())}.</p><button class="btn secondary" data-publish>Lend the first tool ↗</button></div>`;
+}
+function toolCards() {
+  const me = state.me;
+  const tools = listedTools();
+  if (!tools.length) {
+    const where = esc(homePostcode());
+    return `<div class="empty"><h3>A little room for sharing.</h3><p>No tools match this search in ${where}.</p><button class="btn secondary" data-publish>Lend the first tool ↗</button></div>`;
+  }
   return tools.map(t => {
     const own = me && t.owner.id === me.id;
     const statusLabel = { available: 'Ready to share', reserved: 'Reserved', on_loan: 'Out helping', archived: 'Archived' }[t.availability] || t.availability;
     const distance = typeof t.distance_m === 'number' ? `<span class="muted"> · about ${Math.round(t.distance_m)} m away</span>` : '';
-    return `<article class="tool-card"><div class="tool-art ${esc(SVG_KEY[t.category] || 'spade')}">${toolSVG(SVG_KEY[t.category])}<span class="tool-status ${t.availability === 'available' ? '' : 'busy'}"><i></i>${esc(statusLabel)}</span></div><div class="tool-body"><h3>${esc(t.name)}</h3><span class="tool-owner">${esc(t.owner.display_name)}’s tool · ${esc(t.community.postcode)}${distance}</span><div class="tool-bottom"><span>Free to borrow</span><button data-borrow="${esc(t.id)}" ${t.availability !== 'available' || own ? 'disabled' : ''}>${own ? 'Your tool' : t.availability === 'available' ? 'Borrow ↗' : 'Unavailable'}</button></div></div></article>`;
+    const far = typeof t.distance_m === 'number' && t.distance_m > 2000;
+    return `<article class="tool-card"><div class="tool-art ${esc(SVG_KEY[t.category] || 'spade')}">${toolSVG(SVG_KEY[t.category])}<span class="tool-status ${t.availability === 'available' ? '' : 'busy'}"><i></i>${esc(statusLabel)}</span></div><div class="tool-body"><h3>${esc(t.name)}</h3><span class="tool-owner">${esc(t.owner.display_name)}’s tool · ${esc(t.community.postcode)}${distance}</span><div class="tool-bottom"><span>Free to borrow</span><button data-borrow="${esc(t.id)}" ${t.availability !== 'available' || own || far ? 'disabled' : ''}>${own ? 'Your tool' : far ? 'Too far to borrow' : t.availability === 'available' ? 'Borrow ↗' : 'Unavailable'}</button></div></div></article>`;
   }).join('');
+}
+/* The line under the postcode box: plain status, plus a one-click way back
+   once checking a postcode has moved the account to a new street. */
+function postcodeMessage() {
+  if (state.previousHomePostcode) {
+    return `<span>You moved to ${esc(homePostcode())} (${esc(homeOutcode())}). Your previous street is ${esc(state.previousHomePostcode)}.</span> <button type="button" id="back-home">Back to my previous street</button>`;
+  }
+  return `<span>Your community: ${esc(homePostcode())} · served by the backend</span>`;
 }
 function community() {
   const me = state.me;
   const banner = state.impact;
-  return `<section class="hero"><div class="hero-copy"><span class="location"><i></i> Small actions. Right on your doorstep.</span><h1>A little sharing.<br>A <em>greener</em><br>neighbourhood.</h1><p>The tools you need might be just next door.<br>Borrow, lend, and make your patch a little better.</p><form class="postcode-form" id="postcode-form"><span aria-hidden="true">⌖</span><input id="postcode" aria-label="Your UK postcode" value="${esc(postcode())}" maxlength="10" required><button type="submit">Check a postcode ↗</button></form><p class="field-message" id="postcode-message">Your community: ${esc(postcode())} · served by the backend</p></div><div class="hero-art">${gardenArt()}<span class="art-note">Good things grow together.</span><div class="art-label"><div class="mini-avatars"><span>A</span><span>B</span><span>♡</span></span><span>Less buying. More belonging.</span></div></div></section>
-<section><div class="section-heading"><div><h2>A small look at your local patch</h2><p>Environmental context for ${esc(postcode())} — reported per provider by the API.</p></div><span class="eyebrow">YOUR POSTCODE, TOGETHER</span></div><div class="environment">${envCard('≋','The air around you','air_quality','Open-Meteo')}${envCard('ϟ','Your regional electricity','carbon_intensity','NESO Carbon Intensity')}<div class="env-card"><span class="env-icon">♧</span><div><h3>Room to grow</h3><strong>${esc(greenspaceLabel())}</strong><p>Green spaces near ${esc(me.community.outcode)}</p></div></div></div></section>
-<div class="workspace"><section><div class="section-heading"><div><h2>Good tools. Great neighbours.</h2><p>Something sitting in your shed could start something good.</p></div><button class="btn secondary" data-publish>＋ Lend a tool</button></div><div class="filterbar"><div class="filters">${[['all','All tools'],['garden','Gardening'],['cleanup','Clean-up'],['available','Available']].map(([v,l])=>`<button class="chip ${ui.filter===v?'active':''}" data-filter="${v}">${l}</button>`).join('')}</div><input class="search-input" id="tool-search" value="${esc(ui.search)}" placeholder="Search tools…" aria-label="Search tools"></div><div class="tool-grid" id="tool-grid">${toolCards()}</div></section><aside><div class="action-card"><span class="eyebrow">LET’S DO SOME GOOD</span><span class="flower">✳</span><h2>A greener street<br>starts with us.</h2><p>Pick a small action. Find the tools.<br>Make a difference, together.</p><a class="btn primary" href="#task">Start a community action <span>↗</span></a></div><div class="map-card"><h3>⌖ Your next little project</h3>${slot('map','<div class="map-placeholder"><span class="map-symbol">⌑</span><b>A space for your neighbourhood map</b><small>Green spaces module · ready to connect</small></div>')}<p>Real places appear when the location module is connected.</p></div></aside></div><div class="bottom-banner"><span>✳</span><div><strong>The more we share, the more we can do.</strong><p>${banner ? `${banner.active_tools_count} tools shared · ${banner.returned_loans_count} returned loans · ${banner.completed_tasks_count} completed actions in ${esc(me.community.outcode)}.` : 'A missing litter picker today. A whole community clean-up tomorrow.'}</p></div><button class="text-button" data-publish>Be someone’s helpful neighbour ↗</button></div>`;
+  const shownOutcode = esc(homeOutcode());
+  return `<section class="hero"><div class="hero-copy"><span class="location"><i></i> Small actions. Right on your doorstep.</span><h1>A little sharing.<br>A <em>greener</em><br>neighbourhood.</h1><p>The tools you need might be just next door.<br>Borrow, lend, and make your patch a little better.</p><form class="postcode-form" id="postcode-form"><span aria-hidden="true">⌖</span><input id="postcode" aria-label="Your UK postcode" value="${esc(homePostcode())}" maxlength="10" required><button type="submit">Check a postcode ↗</button></form><p class="field-message" id="postcode-message">${postcodeMessage()}</p></div><div class="hero-art">${gardenArt()}<span class="art-note">Good things grow together.</span><div class="art-label"><div class="mini-avatars"><span>A</span><span>B</span><span>♡</span></span></span></div></div></section>
+${storiesStrip()}
+<section><div class="section-heading"><div><h2>A small look at your local patch</h2><p>Environmental context for ${esc(homePostcode())} — reported per provider by the API.</p></div><span class="eyebrow">YOUR POSTCODE, TOGETHER</span></div><div class="environment">${envCard('≋','The air around you','air_quality','Open-Meteo')}${envCard('ϟ','Your regional electricity','carbon_intensity','NESO Carbon Intensity')}<div class="env-card"><span class="env-icon">♧</span><div><h3>Room to grow</h3><strong>${esc(greenspaceLabel())}</strong><p>Green spaces near ${shownOutcode}</p></div></div></div>${contextScoreCard()}</section>
+<div class="workspace"><section><div class="section-heading"><div><h2>Good tools. Great neighbours.</h2><p>Something sitting in your shed could start something good.</p></div><button class="btn secondary" data-publish>＋ Lend a tool</button></div><div class="filterbar"><div class="filters">${[['all','All tools'],['garden','Gardening'],['cleanup','Clean-up'],['available','Available']].map(([v,l])=>`<button class="chip ${ui.filter===v?'active':''}" data-filter="${v}">${l}</button>`).join('')}</div><input class="search-input" id="tool-search" value="${esc(ui.search)}" placeholder="Search tools…" aria-label="Search tools"></div><div class="tool-grid" id="tool-grid">${toolCards()}</div></section><aside><div class="action-card"><span class="eyebrow">LET’S DO SOME GOOD</span><span class="flower">✳</span><h2>A greener street<br>starts with us.</h2><p>Pick a small action. Find the tools.<br>Make a difference, together.</p><a class="btn primary" href="#task">Start a community action <span>↗</span></a></div><div class="map-card" id="project-map">${projectMapCard()}</div></aside></div><div class="bottom-banner"><span>✳</span><div><strong>The more we share, the more we can do.</strong><p>${banner ? `${banner.active_tools_count} tools shared · ${banner.returned_loans_count} returned loans · ${banner.completed_tasks_count} completed actions in ${esc(me.community.outcode)}.` : 'A missing litter picker today. A whole community clean-up tomorrow.'}</p></div><button class="text-button" data-publish>Be someone’s helpful neighbour ↗</button></div>`;
 }
+/* ToolResponse locates a tool at its community's postcode centre. The origin
+   is the signed-in user's home community, which follows the checked postcode. */
+function projectMapCard() {
+  const you = homeCommunity();
+  const tools = listedTools()
+    .filter(t => t.availability === 'available' && t.owner.id !== state.me.id)
+    .map(t => ({ ...t, owner_name: t.owner.display_name, latitude: t.community.latitude, longitude: t.community.longitude }));
+  const green = provider(state.environment, 'greenspace');
+  const greenspaces = isFreshProvider(green) && Array.isArray(green.data) ? green.data.slice(0, 5) : [];
+  const plan = M.planNearestRoute(you, tools);
+  const map = M.renderMapSVG({ you, tools, greenspaces, path: plan.path, nearest: plan.nearest });
+  const description = plan.message === 'no_tools'
+    ? 'No borrowable tools nearby yet. Lend one and the route appears.'
+    : M.describeNearest(plan);
+  const native = `<div class="route-map">${map}</div><p class="route-summary" role="status">${esc(description)}</p><section class="map-green-section" aria-label="Green spaces nearby"><h4>Green spaces nearby</h4>${greenSpacePanel()}</section>`;
+  return `<h3>⌖ Your next little project</h3>${slot('map', native)}`;
+}
+
+/* ---- Stories from the street: latest recorded outcomes, live from the shared
+   ledger. The strip rotates so the home page keeps moving. ---- */
+function streetStories() {
+  return state.tasks
+    .filter(t => t.status === 'completed' && t.outcome && t.outcome.note)
+    .sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || '')));
+}
+function storyCards(stories) {
+  const list = stories || streetStories();
+  if (!list.length) return '';
+  const n = Math.min(3, list.length);
+  const total = list.length;
+  const off = ((ui.storyOffset || 0) % total + total) % total;
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    const t = list[(off + i) % total];
+    const when = t.completed_at ? String(t.completed_at).slice(0, 10) : '';
+    out += `<article class="story-card"><p>${esc(t.outcome.note)}</p><footer><b>${esc(t.creator ? t.creator.display_name : 'A neighbour')}</b><span>${esc(t.title || 'Community action')}${when ? ' · ' + esc(when) : ''}</span></footer></article>`;
+  }
+  return out;
+}
+function storiesStrip() {
+  const stories = streetStories();
+  const body = stories.length
+    ? `<div class="story-row" id="story-row">${storyCards(stories)}</div>`
+    : `<div class="stories-empty" id="story-row">No stories yet — record the first one after your next action.</div>`;
+  return `<section class="stories-strip"><div class="section-heading"><div><h2>Stories from the street</h2><p>The latest actions neighbours recorded — read straight from the shared ledger.</p></div><span class="eyebrow">STORIES FROM THE STREET</span></div>${body}</section>`;
+}
+
 function greenspaceLabel() {
   const p = provider(state.environment, 'greenspace');
   if (p && (p.status === 'ok' || p.status === 'cached')) return p.attribution || 'Connected';
   return 'Find a green space';
 }
 
+/* ------------------------------------------- C: green spaces & context score */
+/* Everything below reads only C's three environment providers (greenspace,
+   air_quality, carbon_intensity). The map card shows the real places C already
+   returns, and the context score is a labelled regional public-data estimate —
+   it never touches D's impact panel (state.impact / impactPanel). */
+function isFreshProvider(p) { return !!p && (p.status === 'ok' || p.status === 'cached'); }
+function finiteNumber(v) {
+  // A provider that answers with null/undefined/'' must not become 0 via
+  // Number() — that would score a missing value as the best possible.
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function captureLabel(iso) { return iso ? `${String(iso).slice(0, 16).replace('T', ' ')} UTC` : 'time not reported'; }
+
+/** Honest reason a provider contributes nothing: a provider that answered but
+ *  returned no value is not the same as one still being waited on. */
+function providerGap(p, source, emptyReason) {
+  return isFreshProvider(p) ? `${source} ${emptyReason}` : `still waiting on ${source}`;
+}
+
+/** The green-space section below the route: C's real places, nearest first,
+ *  with straight-line distance and an honest degraded state that tells an
+ *  empty answer apart from a source still pending. */
+function greenSpacePanel() {
+  const p = provider(state.environment, 'greenspace');
+  const places = isFreshProvider(p) && Array.isArray(p.data)
+    ? p.data.filter(pl => pl && typeof pl.name === 'string') : [];
+  if (!places.length) {
+    const source = (p && (p.source || p.attribution)) || 'OpenStreetMap Overpass API';
+    const detail = providerGap(p, source, 'answered with no named green spaces');
+    return `<div class="map-placeholder"><span class="map-symbol">⌑</span><b>Green spaces near ${esc(homeOutcode())}</b><small>${esc(detail)}.</small></div>`;
+  }
+  const nearestFirst = places.slice().sort((a, b) => (finiteNumber(a.distance_km) ?? Infinity) - (finiteNumber(b.distance_km) ?? Infinity));
+  const rows = nearestFirst.map(pl => {
+    const km = finiteNumber(pl.distance_km);
+    const distance = km === null ? 'distance pending' : `${km.toFixed(2)} km`;
+    return `<li class="green-place"><span class="green-name">${esc(pl.name)}</span><span class="green-type">${esc(pl.type || 'Green space')}</span><span class="green-distance">${esc(distance)}</span></li>`;
+  }).join('');
+  const kind = p.source_kind === 'fixture' ? 'demo fixture' : (p.status === 'cached' || p.source_kind === 'cached' ? 'cached' : 'live');
+  const when = captureLabel(p.fetched_at);
+  // A fixture snapshot must never be mistaken for a live query result.
+  const badge = p.source_kind === 'fixture' ? `<p class="fixture-badge">Demo fixture snapshot — sample data, not a live query. Captured ${esc(when)}.</p>` : '';
+  return `${badge}<ul class="green-list">${rows}</ul><p class="green-source">${esc(p.attribution || p.source || 'Green space data')} · straight-line distance · ${esc(kind)} · ${esc(when)}</p>`;
+}
+
+/** European AQI band -> 0-30 points (the score's air-quality component). */
+function aqiBandPoints(aqi) {
+  if (aqi <= 20) return 30;
+  if (aqi <= 40) return 23;
+  if (aqi <= 60) return 15;
+  if (aqi <= 80) return 8;
+  return 3;
+}
+
+/** Postcode green context score, computed ONLY from C's three providers.
+ *  green access 0-40 = round(40 * (0.5 * min(count_within_2km / 5, 1) +
+ *                                     0.5 * (1 - min(nearest_distance_km, 2) / 2)))
+ *  where count_within_2km only counts the spaces the source actually returns —
+ *  the backend adapter caps that list at 5 (greenspace.MAX_RESULTS), so for
+ *  live data the count term is effectively constant; the component's scope
+ *  text states the cap. air quality 0-30 from the European AQI band,
+ *  electricity 0-30 = round(30 * clean_energy_percentage / 100). A total
+ *  appears only when all three providers answer; a missing provider is never
+ *  treated as zero. */
+function greenContextScore() {
+  // The community page has a single context now that home follows the checked
+  // postcode: the three provider cards, the green-space list and this score all
+  // read state.environment, so they can never disagree about the community.
+  const green = provider(state.environment, 'greenspace');
+  const air = provider(state.environment, 'air_quality');
+  const carbon = provider(state.environment, 'carbon_intensity');
+  const missing = [];
+
+  const distances = isFreshProvider(green) && Array.isArray(green.data)
+    ? green.data.map(pl => pl && finiteNumber(pl.distance_km)).filter(n => n !== null) : [];
+  let greenPoints = null;
+  if (distances.length) {
+    const within = distances.filter(km => km <= 2).length;
+    const nearest = Math.min(...distances);
+    greenPoints = Math.round(40 * (0.5 * Math.min(within / 5, 1) + 0.5 * (1 - Math.min(nearest, 2) / 2)));
+  } else {
+    const greenSource = (green && (green.source || green.attribution)) || 'OpenStreetMap Overpass API';
+    missing.push(providerGap(green, greenSource, 'answered with no named green spaces'));
+  }
+
+  const aqi = isFreshProvider(air) && air.data ? finiteNumber(air.data.aqi) : null;
+  if (aqi === null) {
+    const airSource = (air && (air.source || air.attribution)) || 'Open-Meteo Air Quality';
+    missing.push(providerGap(air, airSource, 'did not report an air-quality index'));
+  }
+
+  const clean = isFreshProvider(carbon) && carbon.data ? finiteNumber(carbon.data.clean_energy_percentage) : null;
+  if (clean === null) {
+    const carbonSource = (carbon && (carbon.source || carbon.attribution)) || 'NESO Carbon Intensity API';
+    missing.push(providerGap(carbon, carbonSource, 'did not report a clean-energy share'));
+  }
+
+  const components = [
+    {
+      key: 'greenspace', label: 'Green access', points: greenPoints, max: 40,
+      source: (green && (green.source || green.attribution)) || 'OpenStreetMap Overpass API',
+      scope: 'Mapped green spaces returned by the source (capped at 5) and distance to the nearest',
+      fixture: !!(green && green.source_kind === 'fixture'), capturedAt: green ? captureLabel(green.fetched_at) : null
+    },
+    {
+      key: 'air_quality', label: 'Air quality', points: aqi === null ? null : aqiBandPoints(aqi), max: 30,
+      source: (air && air.data && air.data.source) || (air && air.attribution) || 'Open-Meteo Air Quality',
+      scope: (air && air.data && air.data.scope) || 'Regional air-quality forecast',
+      fixture: !!(air && air.source_kind === 'fixture'), capturedAt: air ? captureLabel(air.fetched_at) : null
+    },
+    {
+      key: 'carbon_intensity', label: 'Clean electricity', points: clean === null ? null : Math.round(30 * clean / 100), max: 30,
+      source: (carbon && carbon.data && carbon.data.source) || (carbon && carbon.attribution) || 'NESO Carbon Intensity API',
+      scope: (carbon && carbon.data && carbon.data.scope) || 'Regional grid zone',
+      fixture: !!(carbon && carbon.source_kind === 'fixture'), capturedAt: carbon ? captureLabel(carbon.fetched_at) : null
+    }
+  ];
+  const available = components.every(c => c.points !== null);
+  const value = available ? components.reduce((sum, c) => sum + c.points, 0) : null;
+  return {
+    available, value, components, missing,
+    caveat: 'Regional public-data context for this postcode — a modelled estimate from public datasets, not a measurement of what this community’s actions have achieved.'
+  };
+}
+
+function contextScoreCard() {
+  const score = greenContextScore();
+  const rows = score.components.map(c => {
+    const points = c.points === null ? '—' : `<strong>${c.points}</strong>/${c.max}`;
+    const fixtureTag = c.fixture ? `<small class="fixture-tag">Demo fixture · ${esc(c.capturedAt || 'time not reported')}</small>` : '';
+    return `<li class="score-component ${c.points === null ? 'pending' : ''}"><div class="score-points">${points}</div><div class="score-detail"><b>${esc(c.label)}</b><small>${esc(c.source)}</small><small>${esc(c.scope)}</small>${fixtureTag}</div></li>`;
+  }).join('');
+  const total = score.available
+    ? `<strong>${score.value}</strong><span>/ 100</span>`
+    : '<strong class="pending">—</strong><span>/ 100</span>';
+  const pendingLine = score.available ? ''
+    : `<p class="score-pending">Total withheld until every source answers — ${esc(score.missing.join(' and '))}.</p>`;
+  const fixtureBanner = score.components.some(c => c.fixture)
+    ? '<p class="fixture-badge">Includes demo fixture data — a labelled sample snapshot, not a live query.</p>' : '';
+  return `<div class="context-score" id="green-context-score"><div class="score-heading"><span class="eyebrow">REGIONAL PUBLIC-DATA CONTEXT</span><h3>Postcode green context score</h3><div class="score-total">${total}</div></div><p class="score-caveat">${esc(score.caveat)}</p>${fixtureBanner}<ul class="score-components">${rows}</ul>${pendingLine}</div>`;
+}
+
 /* ------------------------------------------------------------------ task page */
+function defaultTaskPlace() {
+  const c = homeCommunity();
+  return { name: `Community centre · ${c.outcode}`, latitude: c.latitude, longitude: c.longitude, source: 'fixture', source_id: null };
+}
+function taskPlaceOptions() {
+  const green = provider(state.environment, 'greenspace');
+  const places = isFreshProvider(green) && Array.isArray(green.data)
+    ? green.data.filter(p => p && typeof p.name === 'string' && p.name.trim() && p.id !== null && p.id !== undefined) : [];
+  return places.map(p => {
+    const latitude = finiteNumber(p.latitude), longitude = finiteNumber(p.longitude);
+    const valid = latitude !== null && longitude !== null && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180;
+    // Provider distance_km describes the home postcode's environment. The
+    // backend always creates actions in the account's home community, which
+    // follows the last checked postcode.
+    const metres = valid ? M.haversineMeters(homeCommunity(), { latitude, longitude }) : Infinity;
+    const reason = !valid ? 'coordinates unavailable' : metres > 2000 ? 'outside the 2 km action area' : '';
+    return { id: String(p.id), type: p.type || 'Green space', distance: finiteNumber(p.distance_km), disabled: !!reason, reason,
+      place: { name: p.name, latitude, longitude, source: 'osm', source_id: String(p.id) } };
+  });
+}
+function selectedTaskPlace(options = taskPlaceOptions()) {
+  const contextId = homeCommunity().id;
+  const selected = ui.selectedPlaceCommunityId === contextId
+    ? options.find(p => p.id === ui.selectedPlaceId && !p.disabled) : null;
+  if (!selected) { ui.selectedPlaceId = null; ui.selectedPlaceCommunityId = contextId; }
+  return selected ? selected.place : defaultTaskPlace();
+}
+function taskPlacePanel(task) {
+  // One panel shape for everyone: the meeting-point list stays visible and only
+  // becomes read-only while an action is in progress, so Alice's and Bob's
+  // pages stay structurally identical.
+  const locked = !!task;
+  if (locked) {
+    const options = taskPlaceOptions();
+    const rows = options.map(p => `<label class="place-option disabled"><input type="radio" name="task-place" disabled><span><b>${esc(p.place.name)}</b><small>${esc(p.type)} · ${p.distance === null ? 'distance pending' : `${p.distance.toFixed(2)} km · straight-line distance`}</small></span></label>`).join('');
+    return `<fieldset class="place-panel" id="task-place-panel"><legend>Where are we helping?</legend><label class="place-option"><input type="radio" checked disabled><span><b>${esc(task.place.name)}</b><small>Meeting point of your in-progress action</small></span></label>${rows}</fieldset><p class="notice">Meeting point is locked while this action is in progress (within 2 km of ${esc(homePostcode())}).</p>`;
+  }
+  const options = taskPlaceOptions();
+  const selected = selectedTaskPlace(options);
+  const rows = options.map(p => `<label class="place-option"><input type="radio" name="task-place" data-task-place="${esc(p.id)}" value="${esc(p.id)}" ${selected.source === 'osm' && selected.source_id === p.id ? 'checked' : ''} ${p.disabled ? 'disabled' : ''}><span><b>${esc(p.place.name)}</b><small>${esc(p.type)} · ${p.distance === null ? 'distance pending' : `${p.distance.toFixed(2)} km · straight-line distance`}${p.reason ? ` · ${esc(p.reason)}` : ''}</small></span></label>`).join('');
+  return `<fieldset class="place-panel" id="task-place-panel"><legend>Where are we helping?</legend><label class="place-option"><input type="radio" name="task-place" data-task-place="" value="" ${selected.source === 'fixture' ? 'checked' : ''}><span><b>${esc(defaultTaskPlace().name)}</b><small>Community centre · default meeting point</small></span></label>${rows}${options.length ? '' : '<small class="muted">Green spaces appear when the environment card has data</small>'}</fieldset><p class="notice">Choose a meeting point, then pick an action. Nothing is saved until you pick an action. Actions stay within 2 km of ${esc(homePostcode())}.</p>`;
+}
 const LOCKED_STATES = ['pending', 'confirmed', 'in_use', 'fulfilled'];
 function requirementRow(row, task) {
   const own = row.loans.slice().sort((a, b) => b.stageOrder - a.stageOrder)[0];
   const viewerIsOrganiser = !!(task && state.me && task.creator && task.creator.id === state.me.id);
   const locked = task.status !== 'open' || LOCKED_STATES.includes(row.state) || !viewerIsOrganiser;
-  const request = row.state === 'match_available' && row.tools.length
-    ? `<button class="btn secondary small" data-borrow="${esc(row.tools[0].toolId)}" data-req="${esc(row.requirementId)}">Request from ${esc(row.tools[0].ownerName)}</button>`
+  const lendable = row.tools.filter(t => !state.me || !t.ownerId || t.ownerId !== state.me.id);
+  const request = row.state === 'match_available' && lendable.length
+    ? `<button class="btn secondary small" data-borrow="${esc(lendable[0].toolId)}" data-req="${esc(row.requirementId)}">Request from ${esc(lendable[0].ownerName)}</button>`
     : '';
   const top = row.tools[0];
   const notes = [];
@@ -285,7 +599,9 @@ function taskPage() {
   const task = myOpenTask();
   // The story panel also shows the most recent finished action, so the
   // numbers the organiser typed are still readable after completion.
-  const storyTask = task || myTasks().filter(t => t.status === 'completed')
+  // The latest story is always the newest FINISHED action — an in-progress
+  // task must not hide it (it has no outcome yet and belongs in the form slot).
+  const storyTask = myTasks().filter(t => t.status === 'completed' && t.outcome && t.outcome.note)
     .sort((a, b) => String(b.completed_at || b.created_at).localeCompare(String(a.completed_at || a.created_at)))[0] || null;
   const ctx = task ? taskContext(task) : { tools: state.tools, loans: state.loans, names: state.names, viewerId: state.me ? state.me.id : null };
   const progress = task ? D.taskProgress(task, ctx) : null;
@@ -301,17 +617,26 @@ function taskPage() {
     : `<p class="notice">No action templates came back from the backend.</p>`;
   const checklist = (task
     ? `<p class="muted">${progress.confirmed} of ${progress.total} requirements confirmed. Finding a tool is only the first step.</p><div class="progress-track"><span style="width:${progress.percent}%"></span></div><p class="muted">${esc(progress.nextAction)}</p>${progress.rows.map(row => requirementRow(row, task)).join('')}${((D.TEMPLATES[task.template_id] || {}).consumables || []).map(c => `<div class="requirement"><div><b>${esc(c.label)}</b><small>Consumable · bring your own, not part of tool loans</small></div><span>↗</span></div>`).join('')}`
-    : `<p class="muted">Pick an action above. The checklist builds itself from the tools your neighbours already have.</p><div class="progress-track"><span style="width:0%"></span></div>`
+    : `<p class="muted">Your tool checklist appears here once you pick a project.</p><div class="progress-track"><span style="width:0%"></span></div>${
+      state.templates.map(t => {
+        const info = D.TEMPLATES[t.id] || {};
+        const need = (info.requirements || []).map(r => D.categoryLabel(r.category) || r.category).join(' + ');
+        return `<div class="requirement ghost"><div><b>${esc(t.title || t.id)}</b><small>${esc(need || 'Tools follow the template')} — pick this project to borrow them</small></div><span>↗</span></div>`;
+      }).join('')
+    }`
   ) + wantedStrip(board);
-  const story = !storyTask
-    ? `<p class="muted">Choose an action first. You can record what you did once the action is under way.</p>`
-    : storyTask.status === 'completed'
-      ? `<p class="muted">Recorded ${esc(String(storyTask.completed_at || '').slice(0, 16).replace('T', ' '))} UTC.</p><label>Your outcome<textarea id="outcome-note" readonly>${esc(recorded ? recorded.note : '')}</textarea></label><div class="impact-fields"><label>Bags collected<input id="impact-bags" type="number" value="${recorded && recorded.bags_collected !== null ? recorded.bags_collected : ''}" readonly></label><label>Volunteer minutes<input id="impact-minutes" type="number" value="${recorded && recorded.volunteer_minutes !== null ? recorded.volunteer_minutes : ''}" readonly></label></div><p class="notice">Self-reported by the organiser. Returns are counted separately from this report.</p>`
-      : `<p class="muted">Finished your action? Record what you did. A returned tool does not complete an action.</p><label>Your outcome<textarea id="outcome-note" maxlength="500" placeholder="What did you do for your neighbourhood?"></textarea></label><div class="impact-fields"><label>Bags collected<input id="impact-bags" type="number" min="0" step="1" value=""></label><label>Volunteer minutes<input id="impact-minutes" type="number" min="0" step="5" value=""></label></div>${readiness && readiness.warning ? `<p class="notice">${esc(readiness.warning)}</p>` : ''}<button class="btn primary" id="complete-task" ${readiness && !readiness.canSubmit ? 'disabled' : ''}>Record completed action ↗</button><p class="muted">Completion is self-reported by the organiser.</p>`;
-  const place = task
-    ? `<label>Where are we helping?<input id="place-name" value="${esc(task.place.name)}" maxlength="120" readonly></label><p class="notice">Meeting point saved with the action by the backend (within 2 km of ${esc(postcode())}).</p>`
-    : `<p class="notice">Nothing is saved until you pick an action. The meeting point is fixed to your community when the action is created.</p>`;
-  return `<div class="page-heading"><span class="eyebrow">SMALL ACTIONS, SHARED POSSIBILITIES</span><h1>Let's make something <em>good.</em></h1><p>Choose an action and bring the right tools together.</p></div><div class="task-layout"><div><section class="panel"><h2>01 / Pick your little project</h2><div class="template-options">${templateButtons}</div>${place}</section><section class="panel"><h2>02 / Bring the tools together</h2>${slot('tasks', checklist)}</section></div><aside><section class="panel"><span class="eyebrow">EVERY STEP COUNTS</span><h2 style="margin-top:15px">03 / Tell the story</h2>${story}</section><section class="panel"><h2>Little actions, adding up.</h2>${slot('outcomes', impactPanel(report))}</section></aside></div>`;
+  const story = (() => {
+    // Same skeleton for everyone: your latest story, then the recording slot.
+    const recordedBlock = recorded
+      ? `<p class="muted">Recorded ${esc(String(storyTask.completed_at || '').slice(0, 16).replace('T', ' '))} UTC.</p><div class="story-quote">${esc(recorded.note)}</div><p class="notice">Self-reported by the organiser. Returns are counted separately from this report.</p>`
+      : `<p class="muted">Nothing recorded yet — your finished actions will appear here.</p>`;
+    const formBlock = task && task.status === 'open'
+      ? `<label>Your outcome<textarea id="outcome-note" maxlength="500" placeholder="What did you do for your neighbourhood?"></textarea></label>${readiness && readiness.warning ? `<p class="notice">${esc(readiness.warning)}</p>` : ''}<button class="btn primary" id="complete-task" ${readiness && readiness.canSubmit === false ? 'disabled' : ''}>Record completed action ↗</button><p class="muted">Self-reported by the organiser. Bringing your own tools is optional — resolve any waiting requests first.</p>`
+      : `<p class="muted">Nothing to record right now — pick an action below, bring the tools together, then tell its story here.</p>`;
+    return `<div class="story-latest"><span class="eyebrow">LATEST STORY</span>${recordedBlock}</div><div class="story-form"><span class="eyebrow">RECORD AN ACTION</span>${formBlock}</div>`;
+  })();
+  const place = taskPlacePanel(task);
+  return `<div class="page-heading"><span class="eyebrow">SMALL ACTIONS, SHARED POSSIBILITIES</span><h1>Let's make something <em>good.</em></h1><p>Choose an action and bring the right tools together.</p></div><div class="task-layout"><div><section class="panel"><h2>01 / Pick your little project</h2>${place}<div class="template-options">${templateButtons}</div></section><section class="panel"><h2>02 / Bring the tools together</h2>${slot('tasks', checklist)}</section></div><aside><section class="panel"><span class="eyebrow">EVERY STEP COUNTS</span><h2 style="margin-top:15px">03 / Tell the story</h2>${story}</section><section class="panel"><h2>Little actions, adding up.</h2>${slot('outcomes', impactPanel(report))}</section></aside></div>`;
 }
 
 /* ------------------------------------------------------------------ loans page */
@@ -324,7 +649,7 @@ function loansPage() {
   return `<div class="page-heading"><span class="eyebrow">SHARED TOOLS. SHARED TRUST.</span><h1>A little give. A little <em>borrow.</em></h1><p>Keep track of the tools making good things happen.</p></div><div class="filters">${[['borrowed','I’m borrowing'],['lent','I’m lending']].map(([v,l])=>`<button class="chip ${ui.loanTab===v?'active':''}" data-loan-tab="${v}">${l}</button>`).join('')}</div><div class="timeline"><span>01 Request sent</span>→<span>02 Reservation accepted</span>→<span>03 Handed over</span>→<span>04 Return confirmed</span></div>${loans.length ? loans.map(l => {
     const isOwner = l.owner_id === me.id;
     const tool = toolOf(l.tool_id);
-    const postcodeOf = tool ? tool.community.postcode : postcode();
+    const postcodeOf = tool ? tool.community.postcode : homePostcode();
     const btn = (action, cls, label) => `<button class="btn ${cls} small" data-transition="${action}" data-id="${esc(l.id)}">${label}</button>`;
     let actions = '';
     if (l.status === 'pending') actions = isOwner
@@ -357,11 +682,9 @@ function render() {
 async function loginSubmit(form, btn) {
   const data = new FormData(form);
   const alias = String(data.get('user_alias') || '').trim();
-  const code = String(data.get('access_code') || '');
   if (!alias) { setLoginMessage('Choose a demo account.'); return; }
-  if (!code.trim()) { setLoginMessage('Enter the demo access code.'); return; }
   await action(btn, async () => {
-    const session = await client.login(alias, code);
+    const session = await client.login(alias);
     token = session.access_token;
     writeStore(TOKEN_KEY, token);
     writeStore(USER_KEY, JSON.stringify({ alias: session.user.alias, display_name: session.user.display_name }));
@@ -372,7 +695,11 @@ async function loginSubmit(form, btn) {
     ui.loading = false;
     render();
     toast(`Signed in as ${session.user.display_name}.`);
-  }, { ignoreAuth: true, onError: err => setLoginMessage(err && err.message ? err.message : 'Sign-in failed.') });
+  }, { ignoreAuth: true, onError: err => setLoginMessage(
+    err && err.code === 'UNAUTHENTICATED'
+      ? 'Unknown demo account. Pick Alice, Bob or Carol.'
+      : (err && err.message ? err.message : 'Sign-in failed.')
+  ) });
 }
 async function publishSubmit(form, btn) {
   const data = new FormData(form);
@@ -394,39 +721,87 @@ async function postcodeSubmit(form, btn) {
   const value = String(input ? input.value : '').trim();
   if (!value) return;
   await action(btn, async () => {
-    const community = await client.resolveCommunity(value);
-    const msg = $('#postcode-message');
-    if (msg) { msg.classList.remove('error'); msg.textContent = `${community.postcode} resolves to a community (${community.outcode}). Your demo account stays in ${postcode()}.`; }
-    toast(`That postcode is real: ${community.postcode}.`);
+    const previous = homePostcode();
+    // Checking the postcode you are already in is a confirmed no-op: the
+    // normalised value never reaches the move endpoint, so no write is made.
+    if (previous && normalisePostcode(value) === normalisePostcode(previous)) {
+      await refresh();
+      render();
+      toast(`${previous} is already your home street.`);
+      return;
+    }
+    // Move the account's own home community, then repaint every surface from
+    // that one context: header identity, environment, score, tools, tasks.
+    state.me = await client.setHomeCommunity(value);
+    // The server may normalise a differently-spelled value onto the street we
+    // are already in; that is still a no-op, so no way back is recorded.
+    if (!previous || state.me.community.postcode === previous) {
+      await refresh();
+      render();
+      toast(`${state.me.community.postcode} is already your home street.`);
+      return;
+    }
+    state.previousHomePostcode = previous;
+    writeStore(PREV_KEY, previous);
+    await refresh();
+    render();
+    toast(`You are now in ${state.me.community.postcode}.`);
   }, { onError: err => {
+    // 422 INVALID_POSTCODE (or a network failure): the account only ever moves
+    // on a successful response, so the current community stays untouched. Show
+    // the server message verbatim under the box.
     const msg = $('#postcode-message');
     if (msg) { msg.textContent = err.message; msg.classList.add('error'); }
   } });
 }
+async function backToHome(btn) {
+  const previous = state.previousHomePostcode;
+  if (!previous) return;
+  await action(btn, async () => {
+    state.me = await client.setHomeCommunity(previous);
+    state.previousHomePostcode = null;
+    dropStore(PREV_KEY);
+    await refresh();   // re-pull the restored street's environment + tools
+    render();
+    toast(`Back to your street: ${state.me.community.postcode}.`);
+  });
+}
 async function chooseTemplate(templateId, btn) {
-  const open = myOpenTask();
-  if (open) {
-    if (open.template_id === templateId) { render(); return; }
-    toast(`You already have an action in progress (“${open.title}”). Record it before starting a different one.`);
+  if (ui.busy) return;
+  const existing = myTasks().filter(t => t.status === 'open' && t.template_id === templateId)
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+  if (existing) {
+    ui.selectedTaskId = existing.id;
+    render();
     return;
   }
   await action(btn, async () => {
     const tpl = state.templates.find(t => t.id === templateId);
-    const c = state.me.community;
-    await client.createTask({
+    const open = myOpenTask();
+    const created = await client.createTask({
       template_id: templateId,
       title: tpl ? tpl.title : templateId,
-      place: { name: `Neighbourhood green space · ${c.outcode}`, latitude: c.latitude, longitude: c.longitude, source: 'manual', source_id: null }
+      // Template switches retain the read-only meeting point of the open action.
+      place: open ? open.place : selectedTaskPlace()
     });
+    ui.selectedTaskId = created.id;
+    ui.selectedPlaceId = null;
     await refresh();
     render();
     toast('Action started. Now bring the tools together.');
-  });
+  }, { verbatim422: true, onError: err => {
+    if (err && err.status === 422) {
+      ui.selectedPlaceId = null;
+      render();
+    }
+  } });
 }
 async function borrow(toolId, requirementId, btn) {
   const tool = state.tools.find(t => t.id === toolId);
   if (!tool || tool.availability !== 'available') { toast('This tool is no longer available to request.'); render(); return; }
   if (state.me && tool.owner.id === state.me.id) { toast('That is your own tool — a neighbour has to borrow it.'); return; }
+  const tooFar = typeof tool.distance_m === 'number' && tool.distance_m > 2000;
+  if (tooFar) { toast('That tool is in another neighbourhood. Borrowing works within 2 km of your street.'); return; }
   await action(btn, async () => {
     const fields = { tool_id: toolId };
     if (requirementId) fields.requirement_id = String(requirementId).split('#')[0];
@@ -462,12 +837,7 @@ async function completeTask(btn) {
   const noteEl = $('#outcome-note');
   const note = String(noteEl && noteEl.value || '').trim();
   if (!note) { toast('Add a short outcome before recording your action.'); if (noteEl && noteEl.focus) noteEl.focus(); return; }
-  const toInt = v => { const s = String(v ?? '').trim(); return /^\d+$/.test(s) ? Number(s) : null; };
-  const body = {
-    outcome_note: note,
-    bags_collected: toInt($('#impact-bags') && $('#impact-bags').value),
-    volunteer_minutes: toInt($('#impact-minutes') && $('#impact-minutes').value)
-  };
+  const body = { outcome_note: note };
   await action(btn, async () => {
     await client.completeTask(task.id, body);
     await refresh();
@@ -495,7 +865,7 @@ document.addEventListener('click', e => {
   if (el.matches('[data-publish]')) {
     const owner = $('#publish-owner'), pc = $('#publish-postcode');
     if (owner) owner.textContent = state.me ? nameOf(state.me.id) : '';
-    if (pc) pc.textContent = postcode();
+    if (pc) pc.textContent = homePostcode();
     const dlg = $('#publish-dialog'); if (dlg) dlg.showModal();
     return;
   }
@@ -506,6 +876,7 @@ document.addEventListener('click', e => {
   if (el.dataset.template) { chooseTemplate(el.dataset.template, el); return; }
   if (el.id === 'integration-open') { const d = $('#integration-dialog'); if (d) d.showModal(); return; }
   if (el.id === 'retry-boot') { boot(); return; }
+  if (el.id === 'back-home') { backToHome(el); return; }
   if (el.id === 'logout') { signOut(el); return; }
   if (el.id === 'complete-task') { completeTask(el); return; }
 });
@@ -514,9 +885,20 @@ document.addEventListener('input', e => {
     ui.search = e.target.value;
     const grid = $('#tool-grid');
     if (grid) grid.innerHTML = toolCards();
+    const map = $('#project-map');
+    if (map) map.innerHTML = projectMapCard();
   }
 });
 document.addEventListener('change', e => {
+  if (e.target.dataset && Object.prototype.hasOwnProperty.call(e.target.dataset, 'taskPlace')) {
+    if (ui.busy || myOpenTask() || !e.target.checked) return;
+    const id = e.target.dataset.taskPlace;
+    const option = taskPlaceOptions().find(p => p.id === id && !p.disabled);
+    ui.selectedPlaceId = option ? option.id : null;
+    ui.selectedPlaceCommunityId = homeCommunity().id;
+    render();
+    return;
+  }
   if (e.target.dataset && e.target.dataset.self) selfSupply(e.target.dataset.self, e.target.checked, e.target);
 });
 document.addEventListener('submit', e => {
@@ -527,5 +909,18 @@ document.addEventListener('submit', e => {
   if (e.target.id === 'postcode-form') return postcodeSubmit(e.target, btn);
 });
 window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
+
+/* Rotate the stories strip without a full repaint (a repaint would steal focus).
+   Guarded: the test sandbox has no timers, browsers do. */
+if (typeof setInterval === 'function') setInterval(() => {
+  if (!state.me || ui.busy) return;
+  const hash = location.hash || '#community';
+  if (hash && hash !== '#community') return;
+  const stories = streetStories();
+  if (stories.length <= 1) return;
+  ui.storyOffset = (ui.storyOffset || 0) + 1;
+  const row = document.getElementById('story-row');
+  if (row && row.classList.contains('story-row')) row.innerHTML = storyCards(stories);
+}, 4500);
 
 boot();

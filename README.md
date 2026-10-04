@@ -1,104 +1,147 @@
-# Borrow Next Door · 集成运行指南
+# Borrow Next Door · Integration & Run Guide
 
-以邮编为中心的邻里工具共享应用。本仓库包含前端（`web/`）、B 后端（`backend/`，FastAPI + SQLite）、对接文档（`docs/handoff/`）与测试（`test/`、`backend/tests/`）。
+## About
 
-## 目录结构
+A postcode-centred neighbourhood tool-sharing app: borrow a neighbour's tool, organise a park clean-up or flowerbed session, then record the return and the outcome of the action. This repository contains the frontend (`web/`), the backend (`backend/`, FastAPI + SQLite), the integration docs and the tests. Tools, tasks and loan records live in the backend — we do not fake multi-user collaboration in the browser.
+
+This is a local competition demo, not a real resident-registration service. **No access code is required to sign in**: pick a demo account and you are in. There are no passwords and these are not verified residents. Demo login is rate-limited to 60 requests per minute per IP, and `APP_MODE=production` refuses to start until real authentication exists.
+
+## How to use it (from scratch)
+
+### 1. Open a terminal and run `./start.sh`
+
+Install Python 3.11+ and Node.js first, then in a terminal go to the project folder (the one containing this file and `start.sh`):
+
+```bash
+cd /your/path/GREENER_BY_POSTCODE
+./start.sh
+```
+
+The script creates `backend/.venv`, installs backend dependencies, initialises the demo database on first run, and starts the backend on :8000 together with the frontend on :5173. **You never generate, type or share an access code.** Keep this terminal window open; press `Ctrl+C` when the demo is over and both services stop together.
+
+Windows users can run the script inside WSL / Git-Bash, or use the manual commands below.
+
+### 2. Open the page in your browser
+
+The script tries to open the browser automatically. If it does not, visit http://localhost:5173 manually. The backend API docs live at http://127.0.0.1:8000/docs. If the page does not load, check the terminal for errors and make sure the services are still running.
+
+### 3. Sign in as Alice / Bob / Carol
+
+Pick a **demo account** on the login panel and click sign in — no access code needed. All three live on home street `EH8 9AB`. A fresh seed ships 3 tools there: Alice's watering can and hand trowel, and Bob's reusable gloves.
+
+The second demo street with tools is `EH14 4AS`, where Dora / Eve hold 4 tools: a long-handled litter picker, a spare glove pair, a copper watering can and a wide garden trowel. Dora / Eve are not in the login picker — browse to their postcode to see their tools.
+
+### 4. What the three tabs do
+
+- **The neighbourhood (`#community`)**: environmental cards for the postcode, the `Postcode green context score`, and the tool list. Filter or search tools, click `Lend a tool` to publish one, or request a borrow.
+- **Make a difference (`#task`)**: choose the `Park cleanup` or `Flowerbed care` template, borrow each required tool or mark it self-supplied, and watch the progress. Once the action is done, record the outcome note, bags collected and volunteer minutes.
+- **My borrowing (`#loans`)**: `I’m borrowing` lists what you borrowed, `I’m lending` what others requested from you. The lender confirms in order: accept, hand over, return. Request sent, reservation accepted, hand-over and return are four separate facts.
+
+### 5. Enter a postcode — you really move to that street
+
+Type `EH14 4AS` into the postcode box on the home page and click `Check a postcode`. This time you **really move**: the frontend calls `POST /api/v1/me/community` to switch the demo account's home community to that postcode. The environment cards, tool list, tasks and lending then all refresh from this new home context — you should see the EH14 4AS tools (Dora / Eve's 4 tools), not the EH8 ones.
+
+A notice appears under the postcode box: `You moved to EH14 4AS (EH14). Your previous street is EH8 9AB.` with a **`Back to my previous street`** button (clicking it reports `Back to your street: EH8 9AB.`). You can also simply type `EH8 9AB` again to go back.
+
+**The move persists**: it writes the server-side account's home community (see `GET /api/v1/me`), so a page refresh stays on the new street. The "back to previous street" affordance also survives a refresh — the frontend keeps only the previous postcode as a UI hint in `localStorage` (key `bnd.previousHomePostcode`); the authoritative community always comes from the server /me. To restore the seeded `EH8 9AB`, run `./start.sh --reset`.
+
+**Entering your current postcode is a no-op**: it does not change the account and does not call `POST /api/v1/me/community`; it simply reports `EH8 9AB is already your home street.`
+
+Being able to see another street is not the same as borrowing there — the backend still enforces distance and permissions (borrow range is within 2 km of your current home street).
+
+If the target street is missing from an old database, rebuild first with `./start.sh --reset` (this clears existing business records).
+
+### 6. The two-window Alice / Bob demo story (7 steps)
+
+Use **two independent browser sessions**: for example a normal window signed in as Alice and a private window as Bob, or two different browsers/profiles. Do not use two plain windows of the same browser — they share login storage. After each action, refresh the other window to see the new state (there is no live push yet).
+
+> ⚠️ **Both windows must be on the same street**: entering a postcode really moves you, so if Alice previously visited `EH14 4AS` (or Bob moved away) the two are no longer in the same community. Before this story, bring both back to `EH8 9AB` — in particular **Alice must return to `EH8 9AB` first**: click `Back to my previous street`, type `EH8 9AB` again, or run `./start.sh --reset`. Otherwise Bob's tool ends up more than 2 km away, and at step 4 the button shows `Too far to borrow`; forcing the call fails with `That tool is in another neighbourhood. Borrowing works within 2 km of your street.` (error code `OUT_OF_RANGE`).
+
+1. **Sign in on both**: window A as Alice, window B as Bob; both start on their `EH8 9AB` home page.
+2. **Bob lends a tool**: on B's home page click `Lend a tool`, fill in a name (e.g. “Bob’s demo litter picker”), pick the `Litter picker` category and a description, then `Make it available`.
+3. **Alice starts an action**: refresh A, open the action tab, choose `Park cleanup`. The template creates two requirements — litter picker and gloves. Mark gloves as self-supplied so the demo only needs one real borrow.
+4. **Alice requests the tool**: on the litter-picker row pick Bob's new tool and click `Request from Bob`. It becomes a pending request and the tool is reserved — not yet handed over.
+5. **Bob accepts and hands over**: refresh B, open `I’m lending`, find the request, click `Accept request`, then confirm the hand-over. States move through `accepted` and `on_loan`; refresh A to see the action progress update.
+6. **Do the action and return**: assume the clean-up happened and Alice gives the tool back; Bob confirms the return on B. The tool is borrowable again, the loan records `returned`, and Alice's requirement becomes `fulfilled`.
+7. **Alice records the outcome**: refresh A, go back to the action tab and submit the outcome note, bags collected and volunteer minutes. Check the completed action and returned-loans metrics. Outcomes are **self-reported** — not externally verified and never presented as proof of regional environmental improvement.
+
+### 7. The map card and the nearest borrowable tool
+
+The map module (`web/map-module.js`) plans a route to the nearest borrowable tool: it builds a grid graph, runs A* to each candidate and picks the lowest-cost one; the module also ships Dijkstra, which the unit tests use to cross-check A* path costs. The map card shows the candidates, highlights the nearest tool, and draws the route with an estimated distance. With no tools or no usable coordinates it shows an empty/degraded state instead of inventing a route.
+
+This is an **algorithm demo on postcode-centre points and a synthetic grid** — not real roads, walking navigation or live GPS. Grid path length and straight-line distance are two different metrics. Borrowability, ownership and permission are still decided by the tool list and backend validation. The green-space list comes from environmental data sorted by straight-line distance from the postcode centre — a different dataset from the borrow route.
+
+### 8. Common commands
+
+Run these from the project root:
+
+```bash
+./start.sh              # start keeping the existing database; no access code
+./start.sh --reset      # delete and rebuild demo data, then start (clears tasks/loans)
+./start.sh --help       # start options
+(cd backend && .venv/bin/pytest -q)  # backend tests
+npm test               # frontend unit tests + attempts a real-backend smoke
+npm run check          # frontend syntax check
+```
+
+Final measured run (2026-10-03): backend **210 passed**, frontend Node tests **89 passed**. The smoke against a real temporary backend passed. `npm test` explicitly **SKIP**s the smoke when nothing is on :8000 — that is not a pass; see `backend/docs/TEST_REPORT.md`.
+
+Manual start (install dependencies per `backend/README.md` first):
+
+```bash
+(cd backend && .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1)
+# in another terminal, from the root
+npm start
+```
+
+You can start directly only if the database already exists; rebuild with `(cd backend && .venv/bin/python scripts/reset_db.py)`. `backend/scripts/dev_server.sh` rebuilds the database every run — do not use it if you want to keep demo progress.
+
+Development ports can be overridden with `BACKEND_PORT=8100 FRONTEND_PORT=5200 ./start.sh`; whether CORS/API base adapt to the new ports needs separate checking — the defaults 8000/5173 are the safest.
+
+## Data sources and honest labelling
+
+- Postcode and centre coordinates: [postcodes.io](https://postcodes.io/). Seed coordinates are fixtures — they are not anyone's exact address.
+- Regional electricity and generation mix: [NESO Carbon Intensity API](https://carbonintensity.org.uk/). Regional data is not the carbon saved by this community's actions.
+- Air quality: [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api) — a model estimate, not a street sensor.
+- Nearby green spaces: Overpass API / [OpenStreetMap](https://www.openstreetmap.org/), © OpenStreetMap contributors. At most 5 results; distances are straight-line estimates from the centre point, not full green coverage.
+- Environment responses distinguish live / cache / stale / fixture. When external services are down we can serve offline demo snapshots (including `EH8 9AB`, `EH14 4AS`), clearly labelled as demo snapshots. No data shows pending/unavailable — we never fill zeros to fake a measurement.
+- The `Postcode green context score` is a contextual estimate from public regional data. Without every required provider the total is withheld, and it is never mixed into loan/action outcome metrics.
+
+## Scope and known limitations
+
+**Done**: access-code-free demo login, tool publishing/browsing, the backend loan state machine, task templates with per-category requirements, self-reported outcomes, community environment adapters with cache/degradation, green-space list and context score card, home/postcode browsing, two demo streets with tools, the map algorithm module. Template switching reuses an existing open task and keeps its progress instead of creating duplicates.
+
+**Not done / deferred**:
+
+- Photo upload and outcome photo storage.
+- Multiple tool slots per category / multi-quantity requirements (each template currently has one requirement per category, `quantity=1`).
+- The `would_have_bought_new` survey and "purchases avoided" metric.
+- Real registration/resident verification, production auth, real road navigation, live multi-user push, load and long-run stability testing.
+
+External network conditions affect environmental data; the borrow flow does not depend on external environment APIs succeeding. Map UI wiring was integrated in parallel — module unit tests and mock-DOM map tests were verified, real-browser map interaction was not acceptance-tested. We also keep an `EH16 5AA` fixture without tools for distance-boundary tests, so the seed database has 3 communities in total while the demo streets with tools are the 2 above.
+
+## Repository layout and integration docs
 
 ```text
-├── backend/            # B 后端（已交付）：FastAPI + SQLite，端口 8000
-│   ├── app/            # 路由、服务、适配器（C 的外部数据适配器在此层）
-│   ├── scripts/        # dev_server.sh / reset_db.py / check_api.sh
-│   ├── tests/          # pytest 契约测试（156 项）
-│   ├── docs/           # API_SAMPLES.md（curl 全表）/ TEST_REPORT.md / DECISIONS.md
-│   └── var/            # sqlite 文件（运行时创建）
-├── web/                # A 前端：app.js / task-module.js（D）/ integrations.js
-├── docs/handoff/       # 对接说明：B 已交付契约、旧模型映射表、C 位置数据、A 界面边界
-├── test/               # 前端测试：纯函数 / 端到端 / 文档契约 / 冒烟
-├── server.cjs          # 前端静态服务器（npm start，端口 5173）
-└── package.json
+backend/       # FastAPI + SQLite, scripts, pytest, backend docs
+web/           # app.js / api.js / task-module.js / map-module.js / integrations.js
+test/          # Node unit tests, mock DOM/API flows, doc contract tests
+services/      # teammate's original environment service (its logic now lives in the backend adapters)
+docs/          # brief materials, plan document and handoff docs
+docs/handoff/  # team interface and boundary notes
+server.cjs     # npm start, frontend static server
+start.sh       # one-command start of both backend and frontend
 ```
 
-## 启动后端（端口 8000）
-
-```bash
-cd backend
-python3.13 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
-
-后端需要环境变量 `DEMO_ACCESS_CODE`（团队运行时配置的演示访问码，≥16 字符；空值、占位值或短于 16 字符会拒绝启动）。两种启动方式：
-
-```bash
-# 方式一：一键脚本（校验环境变量 → 重置数据库 → 启动 uvicorn :8000）
-DEMO_ACCESS_CODE=<团队访问码> ./scripts/dev_server.sh
-
-# 方式二：直接启动 uvicorn（数据库已存在时）
-DEMO_ACCESS_CODE=<团队访问码> .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
-```
-
-启动后：Swagger UI http://127.0.0.1:8000/docs ，OpenAPI JSON http://127.0.0.1:8000/openapi.json 。
-
-重置演示数据库（删除并重建，迁移 + 种子，可重复运行）：
-
-```bash
-.venv/bin/python scripts/reset_db.py
-```
-
-## 演示账号（demo account）
-
-种子数据包含三个演示身份：`alice`、`bob`、`carol`（均属于社区 `EH8 9AB`）。**这些是 demo account，不是真实注册**：不存密码，不代表已验证居民身份。任何界面与文档都应标注 "demo account"。
-
-登录方式：
-
-```bash
-curl -s -X POST "http://127.0.0.1:8000/api/v1/demo/sessions" \
-  -H "Content-Type: application/json" \
-  -d '{"user_alias": "alice", "access_code": "<DEMO_ACCESS_CODE>"}'
-# 成功返回 data.access_token，之后所有请求带 Authorization: Bearer <access_token>
-```
-
-## 启动前端（端口 5173）
-
-在仓库根目录：
-
-```bash
-npm start          # node server.cjs，访问 http://localhost:5173
-```
-
-需要 Node.js，无需安装 npm 依赖。也可直接打开 `web/index.html`；推荐本地服务器，便于同源标签页演示。
-
-## 两窗口演示路径
-
-B 契约的核心是多人协作，**必须在两个浏览器窗口（或两台设备）中验证**，同一窗口的假数据证明不了多人流程：
-
-1. 窗口 A 以 `alice` 登录，窗口 B 以 `bob` 登录（各自 `POST /api/v1/demo/sessions` 取 token）。
-2. 一方在社区页发布工具（`POST /api/v1/tools`，类别限 `litter_picker` / `reusable_gloves` / `watering_can` / `hand_trowel`）。
-3. 另一方创建任务（`POST /api/v1/tasks`，模板限 `park_cleanup` / `flowerbed_care`），对需求申请借用（`POST /api/v1/loans`，带 `requirement_id`）。
-4. 工具所有者在借入借出页依次接受（`/loans/{id}/accept`）、交接（`/loans/{id}/hand-over`）、确认归还（`/loans/{id}/return`）。
-5. 任务创建者独立提交成果（`POST /api/v1/tasks/{id}/complete`，自报 `outcome_note` / `bags_collected` / `volunteer_minutes`）。
-
-所有写请求（除登录 / 注销）带 `Idempotency-Key` 头（UUID）。完整 curl 样例与错误码表见 `backend/docs/API_SAMPLES.md`，字段与状态机细节见 `docs/handoff/B-data-layer.md`。
-
-## 测试
-
-```bash
-# 后端（在 backend/ 目录）：156 项契约测试
-backend/.venv/bin/pytest -q
-
-# 前端（在根目录）：纯函数 + 端到端演示 + 文档契约 + 冒烟
-npm test
-
-# 前端语法检查
-npm run check
-```
-
-## 对接文档
-
-| 文档 | 内容 |
+| Document | Contents |
 |---|---|
-| `docs/handoff/B-data-layer.md` | B 已交付契约：字段表、状态机、幂等、权限、并发错误码、端点全表 |
-| `docs/handoff/B-backend-contract.md` | 旧模型 → B 契约一页映射表 |
-| `docs/handoff/A-ui-boundary.md` | 前端界面边界与回归测试守护的钩子 |
-| `docs/handoff/C-location-data.md` | 位置数据与 B 适配器层的关系 |
-| `backend/docs/API_SAMPLES.md` | 可复制 curl 接口样例（按用户故事排序） |
-| `backend/docs/TEST_REPORT.md` | 后端测试执行记录（156 项全绿） |
+| `backend/README.md` | Backend install, configuration, API boundaries, security notes |
+| `backend/docs/API_SAMPLES.md` | curl examples (the live OpenAPI is authoritative) |
+| `backend/docs/TEST_REPORT.md` | Real test commands, counts, pass/skip boundaries |
+| `backend/docs/DECISIONS.md` | Technical choices and integration decisions |
+| `docs/handoff/B-data-layer.md` | Fields, state machine, idempotency, permissions, concurrency contract |
+| `docs/handoff/B-backend-contract.md` | Old model → B contract mapping |
+| `docs/handoff/A-ui-boundary.md` | Frontend boundaries and test hooks |
+| `docs/handoff/C-location-data.md` | Location data and adapter layer notes |
+
+Business endpoints (everything except login/logout) require an `Idempotency-Key` (UUID) on write requests; the frontend sends one automatically. To call the login API directly, only `{"user_alias":"alice"}` is needed; the response contains a Bearer token, and subsequent business requests use `Authorization: Bearer <token>`.

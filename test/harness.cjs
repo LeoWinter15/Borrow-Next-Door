@@ -1,6 +1,6 @@
 /* DOM + API harness for A's UI wiring.
  *
- * Loads web/task-module.js, web/api.js and web/app.js in a vm context that
+ * Loads web/task-module.js, web/map-module.js, web/api.js and web/app.js in a vm context that
  * looks like a browser: a minimal DOM, localStorage, and a **mock backend**
  * standing in for member B's FastAPI server (test/harness.cjs only — no
  * network, no real server, nothing outside this file).
@@ -15,7 +15,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
-const ACCESS_CODE = 'team-demo-access-code-16ch';
 const TOKEN_KEY = 'bnd.token';
 const USER_KEY = 'bnd.user';
 
@@ -26,20 +25,43 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const now = () => new Date().toISOString();
 const ACTIVE = ['pending', 'accepted', 'on_loan'];
 
+/* Distance between two community/coordinate objects, in metres. */
+function haversineMeters(a, b) {
+  const toRad = d => d * Math.PI / 180;
+  const R = 6371000;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const lat1 = toRad(a.latitude);
+  const lat2 = toRad(b.latitude);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 /* --------------------------------------------------------- mock B backend */
 function createMockBackend(options) {
   options = options || {};
-  const accessCode = options.accessCode || ACCESS_CODE;
 
+  /* Two fixture communities: the demo accounts' home street, and a second
+     postcode visitors can browse to. resolve/lookup go through `registry`. */
   const community = {
     id: 'c1111111-1111-4111-8111-111111111111', postcode: 'EH8 9AB', outcode: 'EH8',
     latitude: 55.944703, longitude: -3.187417, country: 'Scotland',
     source: 'fixture', source_kind: 'fixture', fetched_at: '2026-10-03T09:00:00Z'
   };
+  const otherCommunity = {
+    id: 'c2222222-2222-4222-8222-222222222222', postcode: 'EH14 4AS', outcode: 'EH14',
+    latitude: 55.904100, longitude: -3.248900, country: 'Scotland',
+    source: 'fixture', source_kind: 'fixture', fetched_at: '2026-10-03T09:00:00Z'
+  };
+  const communities = [community, otherCommunity];
+  const registry = new Map(communities.map(c => [c.id, c]));
   const users = {
     alice: { id: 'u1111111-1111-4111-8111-111111111111', alias: 'alice', display_name: 'Alice', community_id: community.id },
     bob: { id: 'u2222222-2222-4222-8222-222222222222', alias: 'bob', display_name: 'Bob', community_id: community.id },
-    carol: { id: 'u3333333-3333-4333-8333-333333333333', alias: 'carol', display_name: 'Carol', community_id: community.id }
+    carol: { id: 'u3333333-3333-4333-8333-333333333333', alias: 'carol', display_name: 'Carol', community_id: community.id },
+    /* Not offered on the sign-in panel: a neighbour one street over, so a
+       browsed community has its own tool to show. */
+    dana: { id: 'u4444444-4444-4444-8444-444444444444', alias: 'dana', display_name: 'Dana', community_id: otherCommunity.id }
   };
   const templates = [
     { id: 'park_cleanup', title: 'Park cleanup', description: 'Collect litter at a local park.', requirements: [{ category: 'litter_picker', quantity: 1 }, { category: 'reusable_gloves', quantity: 1 }] },
@@ -55,6 +77,15 @@ function createMockBackend(options) {
   let seq = 0;
   const rid = () => 'r' + String(++seq).padStart(6, '0');
   const newId = prefix => `${prefix}${String(++seq).padStart(4, '0')}${'x'.repeat(0)}`;
+
+  /* Seeded tool in the *other* fixture community: browsing EH14 4AS must show
+     a different list from home, so the list has to come from the API query. */
+  db.tools.push({
+    id: 't9000000-0000-4000-8000-000000000009', name: 'Colinton wheelbarrow', category: 'hand_trowel',
+    description: 'Lives in the EH14 4AS tool shed.', owner_alias: 'dana',
+    community_id: otherCommunity.id,
+    availability: 'available', is_archived: false, created_at: now(), updated_at: now()
+  });
 
   const ok = (data, extra) => ({ status: 200, body: { data, meta: Object.assign({ request_id: rid() }, extra || {}) } });
   const created = data => ({ status: 201, body: { data, meta: { request_id: rid() } } });
@@ -135,37 +166,43 @@ function createMockBackend(options) {
     const base = {
       id: task.id, title: task.title,
       creator: { id: users[task.creator_alias].id, display_name: users[task.creator_alias].display_name },
-      community_id: community.id, template_id: task.template_id, place: placeOf(task),
+      community_id: task.community_id || community.id, template_id: task.template_id, place: placeOf(task),
       status: task.status, coordination_ready: coordination, completion_eligible: eligible,
       outcome: outcomeOf(task), created_at: task.created_at, completed_at: task.completed_at
     };
     if (full) base.requirements = requirements;
     return base;
   }
-  function toolView(tool) {
+  function toolView(tool, reference) {
+    const where = registry.get(tool.community_id) || community;
+    const from = reference || community;
     return {
       id: tool.id, name: tool.name, category: tool.category, description: tool.description,
       owner: { id: users[tool.owner_alias].id, display_name: users[tool.owner_alias].display_name },
-      community, availability: tool.availability, is_archived: tool.is_archived,
-      distance_m: tool.is_archived ? null : 0.0, created_at: tool.created_at, updated_at: tool.updated_at
+      community: where, availability: tool.availability, is_archived: tool.is_archived,
+      distance_m: tool.is_archived ? null : haversineMeters(from, where), created_at: tool.created_at, updated_at: tool.updated_at
     };
   }
   function loanView(loan) { return Object.assign({}, loan); }
 
-  function environmentPayload() {
+  function environmentPayload(target) {
+    const c = target || community;
     return {
       status: 'partial',
-      postcode: { provider: 'postcode', status: 'ok', data: { postcode: community.postcode }, source_kind: 'fixture', source: 'postcodes.io', source_url: '', attribution: 'postcodes.io (fixture snapshot)', fetched_at: community.fetched_at },
+      postcode: { provider: 'postcode', status: 'ok', data: { postcode: c.postcode }, source_kind: 'fixture', source: 'postcodes.io', source_url: '', attribution: 'postcodes.io (fixture snapshot)', fetched_at: c.fetched_at },
       carbon_intensity: { provider: 'carbon_intensity', status: 'not_implemented', data: null, source_kind: null, source: '', source_url: '', attribution: '', fetched_at: null },
       air_quality: { provider: 'air_quality', status: 'not_implemented', data: null, source_kind: null, source: '', source_url: '', attribution: '', fetched_at: null },
-      greenspace: { provider: 'greenspace', status: 'not_implemented', data: null, source_kind: null, source: '', source_url: '', attribution: '', fetched_at: null }
+      greenspace: { provider: 'greenspace', status: 'ok', data: { outcode: c.outcode }, source_kind: 'fixture', source: 'OpenStreetMap Overpass', source_url: '', attribution: `Greens near ${c.outcode} (fixture snapshot)`, fetched_at: c.fetched_at }
     };
   }
-  function impactPayload() {
+  function impactPayload(target) {
+    const c = target || community;
+    const tools = db.tools.filter(t => !t.is_archived && t.community_id === c.id);
+    const toolIds = new Set(tools.map(t => t.id));
     return {
-      active_tools_count: db.tools.filter(t => !t.is_archived).length,
-      returned_loans_count: db.loans.filter(l => l.status === 'returned').length,
-      completed_tasks_count: db.tasks.filter(t => t.status === 'completed').length,
+      active_tools_count: tools.length,
+      returned_loans_count: db.loans.filter(l => l.status === 'returned' && toolIds.has(l.tool_id)).length,
+      completed_tasks_count: db.tasks.filter(t => t.status === 'completed' && t.community_id === c.id).length,
       as_of: now()
     };
   }
@@ -215,8 +252,9 @@ function createMockBackend(options) {
     /* ---------------------------------------------------------- auth ---- */
     if (path === '/demo/sessions' && method === 'POST') {
       const alias = body && body.user_alias;
-      const code = body && body.access_code;
-      if (!users[alias] || code !== accessCode) return fail(401, 'UNAUTHENTICATED', 'Authentication required.');
+      /* Alias-only demo sign-in: the access code was removed by user decision.
+         A stray access_code is accepted and ignored, like the real backend. */
+      if (!users[alias]) return fail(401, 'UNAUTHENTICATED', 'Unknown demo account.');
       const token = `tok-${alias}-${++seq}`;
       sessions.set(token, { alias, valid: true });
       return created({ access_token: token, token_type: 'bearer', expires_at: now(), user: users[alias] });
@@ -230,7 +268,34 @@ function createMockBackend(options) {
       return ok({ revoked: true });
     }
     if (path === '/me' && method === 'GET') {
-      return ok({ id: viewer.id, display_name: viewer.display_name, community, mode: 'demo' });
+      const where = registry.get(viewer.community_id) || community;
+      return ok({ id: viewer.id, display_name: viewer.display_name, community: where, mode: 'demo' });
+    }
+    /* The demo "move my street" write: resolve the postcode and point the
+       account's users.community_id at it, returning the /me shape. */
+    if (path === '/me/community' && method === 'POST') {
+      const fp = JSON.stringify([method, path, body]);
+      const entry = idempotent(init, viewer, fp);
+      if (entry.body) return entry;
+      const value = String((body && body.postcode) || '').toUpperCase().replace(/\s+/g, ' ').trim();
+      if (!/^(GIR 0AA|[A-Z]{1,2}\d[A-Z\d]? \d[A-Z]{2})$/.test(value)) {
+        return fail(422, 'INVALID_POSTCODE', 'That postcode could not be resolved.');
+      }
+      let found = communities.find(c => c.postcode === value);
+      if (!found) {
+        const outcode = value.split(' ')[0];
+        found = {
+          id: 'c-' + outcode.toLowerCase(), postcode: value, outcode,
+          latitude: 55.9000, longitude: -3.2500, country: 'Scotland',
+          source: 'fixture', source_kind: 'fixture', fetched_at: now()
+        };
+        communities.push(found);
+        registry.set(found.id, found);
+      }
+      users[viewer.alias].community_id = found.id;
+      return rememberIdem(entry, ok({
+        id: viewer.id, display_name: viewer.display_name, community: found, mode: 'demo'
+      }));
     }
 
     /* -------------------------------------------------------- templates -- */
@@ -243,7 +308,10 @@ function createMockBackend(options) {
       const scope = parsed.searchParams.get('scope') || 'mine';
       let rows = db.tasks;
       if (scope === 'mine') rows = rows.filter(t => t.creator_alias === viewer.alias);
-      else rows = rows.filter(t => t.community_id === community.id);
+      else {
+        const cid = parsed.searchParams.get('community_id') || users[viewer.alias].community_id;
+        rows = rows.filter(t => t.community_id === cid);
+      }
       return ok(rows.map(t => taskView(t, false)), { limit: 20, offset: 0, total: rows.length });
     }
     let m = path.match(/^\/tasks\/([^/]+)$/);
@@ -259,13 +327,14 @@ function createMockBackend(options) {
       const tpl = templates.find(t => t.id === (body && body.template_id));
       if (!tpl) return fail(422, 'VALIDATION_ERROR', 'Request validation failed.', { fields: [{ field: 'template_id', message: 'unknown template' }] });
       if (body.place) {
-        const dLat = (body.place.latitude - community.latitude) * 111000;
-        const dLon = (body.place.longitude - community.longitude) * 111000 * Math.cos(55.9 * Math.PI / 180);
+        const home = registry.get(users[viewer.alias].community_id) || community;
+        const dLat = (body.place.latitude - home.latitude) * 111000;
+        const dLon = (body.place.longitude - home.longitude) * 111000 * Math.cos(55.9 * Math.PI / 180);
         if (Math.hypot(dLat, dLon) > 2000) return fail(422, 'OUT_OF_RANGE', 'A value is outside the allowed range.', { fields: [{ field: 'place', message: 'place must be within 2000 m of the user\'s community' }] });
       }
       const task = {
         id: newId('k'), title: (body.title || tpl.title).slice(0, 120),
-        creator_alias: viewer.alias, community_id: community.id, template_id: tpl.id,
+        creator_alias: viewer.alias, community_id: users[viewer.alias].community_id, template_id: tpl.id,
         place_name: body.place ? body.place.name : 'Neighbourhood green space',
         place_latitude: body.place ? body.place.latitude : community.latitude,
         place_longitude: body.place ? body.place.longitude : community.longitude,
@@ -323,8 +392,20 @@ function createMockBackend(options) {
       const category = parsed.searchParams.get('category');
       let rows = db.tools.filter(t => !t.is_archived);
       if (category) rows = rows.filter(t => t.category === category);
+      // The list a caller sees is scoped to the community it asks for, within
+      // radius_m of that community's centre — this is what makes browsing a
+      // different postcode return a different set of tools.
+      const cid = parsed.searchParams.get('community_id');
+      let ref = community;
+      if (cid) {
+        const target = registry.get(cid);
+        if (!target) return fail(404, 'NOT_FOUND', 'Community not found.');
+        ref = target;
+        const radius = Number(parsed.searchParams.get('radius_m') || 2000);
+        rows = rows.filter(t => haversineMeters(target, registry.get(t.community_id) || community) <= radius);
+      }
       const limit = Number(parsed.searchParams.get('limit') || 20);
-      return ok(rows.slice(0, limit).map(toolView), { limit, offset: 0, total: rows.length });
+      return ok(rows.slice(0, limit).map(t => toolView(t, ref)), { limit, offset: 0, total: rows.length });
     }
     if (path === '/tools' && method === 'POST') {
       const fp = JSON.stringify([method, path, body]);
@@ -340,10 +421,11 @@ function createMockBackend(options) {
       const tool = {
         id: newId('t'), name: body.name.slice(0, 80), category: body.category,
         description: (body.description || '').slice(0, 500), owner_alias: viewer.alias,
+        community_id: users[viewer.alias].community_id,
         availability: 'available', is_archived: false, created_at: now(), updated_at: now()
       };
       db.tools.unshift(tool);
-      return rememberIdem(entry, created(toolView(tool)));
+      return rememberIdem(entry, created(toolView(tool, registry.get(tool.community_id) || community)));
     }
     m = path.match(/^\/tools\/([^/]+)\/archive$/);
     if (m && method === 'POST') {
@@ -355,13 +437,13 @@ function createMockBackend(options) {
       if (tool.owner_alias !== viewer.alias) return fail(403, 'FORBIDDEN', 'Only the owner can archive a tool.');
       if (db.loans.some(l => l.tool_id === tool.id && ACTIVE.includes(l.status))) return fail(409, 'ACTIVE_LOAN_EXISTS', 'This tool has an active loan.');
       tool.is_archived = true; tool.availability = 'archived'; tool.updated_at = now();
-      return rememberIdem(entry, ok(toolView(tool)));
+      return rememberIdem(entry, ok(toolView(tool, registry.get(viewer.community_id) || community)));
     }
     m = path.match(/^\/tools\/([^/]+)$/);
     if (m && method === 'GET') {
       const tool = db.tools.find(t => t.id === m[1]);
       if (!tool) return fail(404, 'NOT_FOUND', 'Tool not found.');
-      return ok(toolView(tool));
+      return ok(toolView(tool, registry.get(viewer.community_id) || community));
     }
 
     /* ----------------------------------------------------------- loans --- */
@@ -430,17 +512,31 @@ function createMockBackend(options) {
     if (path === '/communities/resolve' && method === 'GET') {
       const value = (parsed.searchParams.get('postcode') || '').toUpperCase().replace(/\s+/g, ' ').trim();
       if (!/^(GIR 0AA|[A-Z]{1,2}\d[A-Z\d]? \d[A-Z]{2})$/.test(value)) return fail(422, 'INVALID_POSTCODE', 'That postcode could not be resolved.');
-      return ok(Object.assign({}, community, { postcode: value }));
+      let found = communities.find(c => c.postcode === value);
+      if (!found) {
+        // Any other valid UK postcode resolves to its own (fixture) community,
+        // like postcodes.io would — never silently to the caller's home.
+        const outcode = value.split(' ')[0];
+        found = {
+          id: 'c-' + outcode.toLowerCase(), postcode: value, outcode,
+          latitude: 55.9000, longitude: -3.2500, country: 'Scotland',
+          source: 'fixture', source_kind: 'fixture', fetched_at: now()
+        };
+        registry.set(found.id, found);
+      }
+      return ok(Object.assign({}, found));
     }
     m = path.match(/^\/communities\/([^/]+)\/environment$/);
     if (m && method === 'GET') {
-      if (m[1] !== community.id) return fail(404, 'NOT_FOUND', 'Community not found.');
-      return ok(environmentPayload());
+      const target = registry.get(m[1]);
+      if (!target) return fail(404, 'NOT_FOUND', 'Community not found.');
+      return ok(environmentPayload(target));
     }
     m = path.match(/^\/communities\/([^/]+)\/impact$/);
     if (m && method === 'GET') {
-      if (m[1] !== community.id) return fail(404, 'NOT_FOUND', 'Community not found.');
-      return ok(impactPayload());
+      const target = registry.get(m[1]);
+      if (!target) return fail(404, 'NOT_FOUND', 'Community not found.');
+      return ok(impactPayload(target));
     }
 
     return fail(404, 'NOT_FOUND', `No route for ${method} ${path}.`);
@@ -467,7 +563,7 @@ function createMockBackend(options) {
 
   return {
     fetch: fetchImpl,
-    db, calls, writes, sessions, accessCode, community,
+    db, calls, writes, sessions, community, otherCommunity, registry,
     users,
     /** Invalidate every session so the next authenticated call is a 401. */
     expireSessions() { sessions.forEach(s => { s.valid = false; }); },
@@ -573,6 +669,10 @@ function createApp(options) {
   if (!context.BND_TASK) throw new Error('web/task-module.js did not publish BND_TASK');
   context.window.BND_TASK = context.BND_TASK;
 
+  vm.runInContext(fs.readFileSync(path.join(ROOT, 'web/map-module.js'), 'utf8'), context);
+  if (!context.BND_MAP) throw new Error('web/map-module.js did not publish BND_MAP');
+  context.window.BND_MAP = context.BND_MAP;
+
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'web/api.js'), 'utf8'), context);
   if (!context.BND_API) throw new Error('web/api.js did not publish BND_API');
   context.window.BND_API = context.BND_API;
@@ -601,4 +701,4 @@ function createApp(options) {
   };
 }
 
-module.exports = { createApp, createMockBackend, ACCESS_CODE, TOKEN_KEY, USER_KEY };
+module.exports = { createApp, createMockBackend, TOKEN_KEY, USER_KEY };

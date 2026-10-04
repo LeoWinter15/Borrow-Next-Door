@@ -334,8 +334,8 @@ def test_list_tasks_scopes_and_pagination(client, alice_token, bob_token, settin
     resp = client.get(f"{API}/tasks", headers=headers(alice_token))
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["meta"]["total"] == 3
-    assert len(body["data"]) == 3
+    assert body["meta"]["total"] == 4  # 3 fixture + 1 seeded demo story
+    assert len(body["data"]) == 4  # 3 fixture + 1 seeded demo story
     assert {t["creator"]["id"] for t in body["data"]} == {alice_id}
     for item in body["data"]:
         assert "requirements" not in item
@@ -362,11 +362,11 @@ def test_list_tasks_scopes_and_pagination(client, alice_token, bob_token, settin
     page2 = client.get(
         f"{API}/tasks?limit=2&offset=2", headers=headers(alice_token)
     ).json()
-    assert len(page1["data"]) == 2 and page1["meta"]["total"] == 3
+    assert len(page1["data"]) == 2 and page1["meta"]["total"] == 4
     assert page1["meta"]["limit"] == 2 and page1["meta"]["offset"] == 0
-    assert len(page2["data"]) == 1 and page2["meta"]["total"] == 3
+    assert len(page2["data"]) == 2 and page2["meta"]["total"] == 4
     ids = {t["id"] for t in page1["data"]} | {t["id"] for t in page2["data"]}
-    assert len(ids) == 3  # stable, non-overlapping pages
+    assert len(ids) == 4  # stable, non-overlapping pages (3 fixture + 1 seeded story)
 
     # scope=community requires community_id.
     resp = client.get(f"{API}/tasks?scope=community", headers=headers(alice_token))
@@ -386,7 +386,7 @@ def test_list_tasks_scopes_and_pagination(client, alice_token, bob_token, settin
         headers=headers(alice_token),
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["meta"]["total"] == 4
+    assert resp.json()["meta"]["total"] == 6  # 4 fixture + 2 seeded demo stories
     assert {t["creator"]["id"] for t in resp.json()["data"]} == {
         alice_id,
         user_id(settings, "bob"),
@@ -411,7 +411,9 @@ def test_state_match_available_and_missing(client, alice_token):
     assert gloves["state"] == "match_available"
     assert gloves["candidate_tool_ids"] == [GLOVES_TOOL]
     assert data["coordination_ready"] is False
-    assert data["completion_eligible"] is False
+    # 2026-10-03 product decision: a missing/matchable tool does not block
+    # recording — only unresolved requests (pending/confirmed) do.
+    assert data["completion_eligible"] is True
 
 
 def test_state_self_supplied(client, alice_token):
@@ -561,16 +563,16 @@ def test_ready_and_eligible_combinations(client, alice_token, settings):
     litter = req_by_category(data, "litter_picker")
     gloves = req_by_category(data, "reusable_gloves")
 
-    # Neither covered yet.
+    # Neither covered yet: still recordable (checklist is guidance).
     assert data["coordination_ready"] is False
-    assert data["completion_eligible"] is False
+    assert data["completion_eligible"] is True
 
     # One self-supplied, one still only matchable: still not coordinated.
     put_self_supply(client, alice_token, data["id"], litter["id"], True)
     data = get_task(client, alice_token, data["id"]).json()["data"]
     assert req_by_category(data, "litter_picker")["state"] == "self_supplied"
     assert data["coordination_ready"] is False
-    assert data["completion_eligible"] is False
+    assert data["completion_eligible"] is True
 
     # Confirmed booking: coordinated but not completion-eligible.
     insert_loan(
@@ -674,15 +676,36 @@ def test_self_supply_rejects_non_boolean(client, alice_token):
 # --- Completion ----------------------------------------------------------------
 
 
-def test_complete_requires_eligibility(client, alice_token):
+def test_complete_requires_eligibility(client, alice_token, settings):
     data = task_data(create_task(client, alice_token))  # missing + match_available
+    gloves = req_by_category(data, "reusable_gloves")
+    # A request still waiting on a neighbour blocks recording.
+    insert_loan(
+        settings,
+        tool_id=GLOVES_TOOL,
+        borrower_id=user_id(settings, "carol"),
+        requirement_id=gloves["id"],
+        status="pending",
+    )
     resp = complete(
         client, alice_token, data["id"], {"outcome_note": "Finished the cleanup."}
     )
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "TASK_NOT_READY"
-    # Nothing changed.
     assert get_task(client, alice_token, data["id"]).json()["data"]["status"] == "open"
+    # Resolve the request (cancel the pending loan); missing/matchable tools
+    # do NOT force self-supply.
+    with db(settings) as conn, write_transaction(conn):
+        conn.execute(
+            "UPDATE loans SET status='cancelled', cancelled_at=?, updated_at=? "
+            "WHERE requirement_id=? AND status='pending'",
+            (utc_now(), utc_now(), gloves["id"]),
+        )
+    resp = complete(
+        client, alice_token, data["id"], {"outcome_note": "Finished the cleanup."}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["status"] == "completed"
 
 
 def test_complete_success_replay_noop_and_conflict(client, alice_token):
@@ -1033,7 +1056,7 @@ def test_create_task_idempotent_replay_and_key_reuse(client, alice_token):
 
     # Only one task was actually created.
     listing = client.get(f"{API}/tasks", headers=headers(alice_token))
-    assert listing.json()["meta"]["total"] == 1
+    assert listing.json()["meta"]["total"] == 2  # 1 created here + 1 seeded demo story
 
     # Same key, different intent -> 409.
     third = client.post(
